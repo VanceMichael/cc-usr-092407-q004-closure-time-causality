@@ -1,0 +1,11 @@
+FROM alpine:3.23
+
+WORKDIR /workspace
+
+COPY contracts/ contracts/
+COPY fixtures/ fixtures/
+COPY scaffold/ scaffold/
+
+RUN sh scaffold/validate_inputs.sh
+
+CMD ["sleep", "2147483647"]
