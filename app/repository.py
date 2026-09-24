@@ -52,6 +52,18 @@ CREATE INDEX IF NOT EXISTS idx_impacts_root    ON impacts(root_event_id);
 CREATE INDEX IF NOT EXISTS idx_impacts_airport ON impacts(airport_code, impact_status);
 CREATE INDEX IF NOT EXISTS idx_impacts_flight  ON impacts(flight_id);
 CREATE INDEX IF NOT EXISTS idx_events_airport  ON events(airport_code, event_version);
+
+-- 启动审计标记的异常事件链。成员事件与影响仍保留在 events/impacts 中供只读
+-- 追溯，但不参与当前汇总。结论只依赖事件内容（detected_at 取组内最晚
+-- reported_at），容器重建后重新审计得到相同判定。
+CREATE TABLE IF NOT EXISTS chain_anomalies (
+    group_id        TEXT PRIMARY KEY,
+    airport_code    TEXT NOT NULL,
+    reasons_json    TEXT NOT NULL,
+    members_json    TEXT NOT NULL,
+    violations_json TEXT NOT NULL,
+    detected_at     TEXT NOT NULL
+);
 """
 
 
@@ -74,6 +86,7 @@ class Repository:
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.executescript(SCHEMA)
+        self._quarantined: frozenset[str] = self._load_quarantined()
 
     def close(self) -> None:
         with self._lock:
@@ -103,15 +116,100 @@ class Repository:
                 )
             )
 
-    def events_for_airport(self, airport_code: str) -> list[sqlite3.Row]:
+    def events_for_airport(
+        self, airport_code: str, *, include_quarantined: bool = False
+    ) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM events WHERE airport_code = ?"
+        params: list[Any] = [airport_code]
+        if not include_quarantined and self._quarantined:
+            placeholders = ", ".join("?" for _ in self._quarantined)
+            sql += f" AND event_id NOT IN ({placeholders})"
+            params.extend(sorted(self._quarantined))
+        sql += " ORDER BY event_version, effective_from"
+        with self._lock:
+            return list(self._conn.execute(sql, params))
+
+    def all_events(self) -> list[sqlite3.Row]:
         with self._lock:
             return list(
                 self._conn.execute(
-                    "SELECT * FROM events WHERE airport_code = ? "
-                    "ORDER BY event_version, effective_from",
-                    (airport_code,),
+                    "SELECT * FROM events ORDER BY airport_code, event_version, event_id"
                 )
             )
+
+    # ------------------------------------------------------------------ #
+    # Quarantined anomalous chains (startup audit)
+    # ------------------------------------------------------------------ #
+
+    def _load_quarantined(self) -> frozenset[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT members_json FROM chain_anomalies").fetchall()
+        members: set[str] = set()
+        for row in rows:
+            members.update(json.loads(row["members_json"]))
+        return frozenset(members)
+
+    @property
+    def quarantined_event_ids(self) -> frozenset[str]:
+        return self._quarantined
+
+    def is_quarantined(self, event_id: str | None) -> bool:
+        return event_id is not None and event_id in self._quarantined
+
+    def get_anomalies(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM chain_anomalies ORDER BY airport_code, group_id"
+            ).fetchall()
+        result = []
+        for row in rows:
+            result.append(
+                {
+                    "group_id": row["group_id"],
+                    "airport_code": row["airport_code"],
+                    "reasons": json.loads(row["reasons_json"]),
+                    "members": json.loads(row["members_json"]),
+                    "violations": json.loads(row["violations_json"]),
+                    "detected_at": row["detected_at"],
+                }
+            )
+        return result
+
+    def anomaly_for_event(self, event_id: str) -> dict[str, Any] | None:
+        for anomaly in self.get_anomalies():
+            if event_id in anomaly["members"]:
+                return anomaly
+        return None
+
+    def replace_anomalies(
+        self, conn: sqlite3.Connection, anomalies: Iterable[dict[str, Any]]
+    ) -> None:
+        """用最新审计结论整体替换异常标记（在单个事务内）。"""
+        conn.execute("DELETE FROM chain_anomalies")
+        conn.executemany(
+            """
+            INSERT INTO chain_anomalies (group_id, airport_code, reasons_json,
+                                         members_json, violations_json, detected_at)
+            VALUES (:group_id, :airport_code, :reasons_json, :members_json,
+                    :violations_json, :detected_at)
+            """,
+            [
+                {
+                    "group_id": a["group_id"],
+                    "airport_code": a["airport_code"],
+                    "reasons_json": json.dumps(a["reasons"], ensure_ascii=False),
+                    "members_json": json.dumps(sorted(a["members"]), ensure_ascii=False),
+                    "violations_json": json.dumps(
+                        a["violations"], ensure_ascii=False, sort_keys=True
+                    ),
+                    "detected_at": a["detected_at"],
+                }
+                for a in anomalies
+            ],
+        )
+
+    def refresh_quarantine_set(self) -> None:
+        self._quarantined = self._load_quarantined()
 
     def count_replays(self, event_id: str) -> int:
         with self._lock:
@@ -125,15 +223,25 @@ class Repository:
         *,
         airport: str | None = None,
         status: str | None = None,
+        include_quarantined: bool = False,
     ) -> list[dict[str, Any]]:
         """返回每个航班与机场组合的最新影响。
 
         同一机场内，每条事件链采用最新事件的快照；航班同时出现在多条链时，
         采用最后生成的快照。`resolved` 墓碑参与排序，使恢复开放后释放的航班
-        不再出现在结果中。最终结果按 flight_id 稳定排序。
+        不再出现在结果中。启动审计标记的异常链默认排除，不污染当前汇总。
+        最终结果按 flight_id 稳定排序。
         """
         where = ["i.airport_code = ?"] if airport else []
         params: list[Any] = [airport] if airport else []
+
+        excluded: tuple[str, ...] = ()
+        if not include_quarantined and self._quarantined:
+            excluded = tuple(sorted(self._quarantined))
+            placeholders = ", ".join("?" for _ in excluded)
+            where.append(f"e.event_id NOT IN ({placeholders})")
+            params.extend(excluded)
+
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
         outer = ["rn = 1", "impact_status != 'resolved'"]

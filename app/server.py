@@ -83,6 +83,7 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                                 "GET  /api/v1/events/{event_id}",
                                 "GET  /api/v1/airports/{airport_code}/summary",
                                 "GET  /api/v1/flights/affected",
+                                "GET  /api/v1/chains/anomalies",
                                 "GET  /healthz",
                             ],
                         },
@@ -106,6 +107,11 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 if path == "/api/v1/flights/affected":
                     self._require_method(method, "GET", path)
                     self._send_json(200, self._affected_flights(query))
+                    return
+
+                if path == "/api/v1/chains/anomalies":
+                    self._require_method(method, "GET", path)
+                    self._send_json(200, state.service.chain_anomalies())
                     return
 
                 if path == "/api/v1/events":

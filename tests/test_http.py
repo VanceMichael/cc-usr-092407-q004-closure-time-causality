@@ -166,6 +166,82 @@ class HttpTest(ServiceTestCase):
         self.assertTrue(all(i["crosses_midnight"] for i in body["impacts"]))
         self.assertEqual(body["impact_count"], 3)
 
+    def test_causal_rejection_names_conflicting_field(self) -> None:
+        # Establish a closure, then send a reopen that precedes the root closure.
+        _request("POST", f"{self.base}/api/v1/events", base_event())
+        bad_reopen = {
+            "event_id": "evt-reopen-bad01",
+            "event_version": 2,
+            "event_type": "airport.reopened",
+            "airport_code": "APS",
+            "effective_from": "2026-09-07T14:30:00Z",
+            "reported_at": "2026-09-07T14:31:00Z",
+            "supersedes_event_id": "evt-close0000001",
+        }
+        status, body = _request("POST", f"{self.base}/api/v1/events", bad_reopen)
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "validation_error")
+        errors = body["error"]["details"]["errors"]
+        causal = [e for e in errors if e["issue"] == "reopen_before_chain_start"]
+        self.assertEqual(len(causal), 1)
+        self.assertEqual(causal[0]["field"], "effective_from")
+        # The rejected event must not be retrievable (no partial write).
+        status, _ = _request("GET", f"{self.base}/api/v1/events/evt-reopen-bad01")
+        self.assertEqual(status, 404)
+
+    def test_extension_before_root_422(self) -> None:
+        _request("POST", f"{self.base}/api/v1/events", base_event())
+        bad = {
+            "event_id": "evt-extend-bad01",
+            "event_version": 2,
+            "event_type": "airport.extended",
+            "airport_code": "APS",
+            "effective_from": "2026-09-07T13:00:00Z",
+            "effective_until": "2026-09-07T20:00:00Z",
+            "reported_at": "2026-09-07T14:30:00Z",
+            "supersedes_event_id": "evt-close0000001",
+        }
+        status, body = _request("POST", f"{self.base}/api/v1/events", bad)
+        self.assertEqual(status, 422)
+        issues = {e["issue"]: e for e in body["error"]["details"]["errors"]}
+        self.assertIn("must_not_precede_root_closure", issues)
+        self.assertEqual(issues["must_not_precede_root_closure"]["field"], "effective_from")
+
+    def test_anomalies_endpoint_lists_quarantined_chains(self) -> None:
+        # Seed an anomalous chain directly, then run the startup audit.
+        from tests.test_chain_integration import _raw_insert
+        from tests.support import base_event as _base
+
+        _raw_insert(self.service, _base())
+        _raw_insert(
+            self.service,
+            {
+                "event_id": "evt-reopen000001",
+                "event_version": 2,
+                "event_type": "airport.reopened",
+                "airport_code": "APS",
+                "effective_from": "2026-09-07T14:30:00Z",
+                "reported_at": "2026-09-07T14:31:00Z",
+                "supersedes_event_id": "evt-close0000001",
+            },
+        )
+        self.service.audit_chains()
+
+        status, body = _request("GET", f"{self.base}/api/v1/chains/anomalies")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["quarantined_chain_count"], 1)
+        self.assertIn("reopen_before_chain_start", body["chains"][0]["reasons"])
+
+        # The quarantined event remains readable and carries the trace marker.
+        status, status_body = _request(
+            "GET", f"{self.base}/api/v1/events/evt-close0000001"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(status_body["chain_state"], "quarantined")
+        self.assertEqual(
+            status_body["chain_anomaly"]["group_id"], "evt-close0000001"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

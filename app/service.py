@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
+from app.chain_rules import (
+    audit_stored,
+    edge_violations,
+    timing_violations,
+)
 from app.errors import EventConflictError, NotFoundError, ValidationError
 from app.engine import compute_impacts
 from app.models import (
     EVENT_CLOSED,
-    EVENT_EXTENDED,
     EVENT_REOPENED,
     Airport,
     DisruptionEvent,
     Flight,
+    iso_utc,
 )
 from app.repository import Repository
 from app.validation import validate_event
@@ -26,13 +31,46 @@ class DisruptionService:
         repo: Repository,
         airports: dict[str, Airport],
         flights: dict[str, Flight],
+        *,
+        clock: Callable[[], datetime] | None = None,
     ):
         self._repo = repo
         self._airports = airports
         self._flights = flights
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def healthy(self) -> bool:
         return self._repo.ping()
+
+    # ------------------------------------------------------------------ #
+    # Startup audit
+    # ------------------------------------------------------------------ #
+
+    def audit_chains(self) -> list[dict[str, Any]]:
+        """重新审计全部已持久化事件链并落定异常标记。
+
+        判定只依赖事件内容，结论确定性：同一数据库在任意时间、容器重建后
+        重新审计得到完全相同的分组、原因和成员。异常链保留原始事件/影响
+        供只读追溯，但从当前汇总中隔离。
+        """
+        rows = self._repo.all_events()
+        events = {row["event_id"]: _row_to_event(row) for row in rows}
+        anomalies = audit_stored(events, self._airports)
+        payload = [
+            {
+                "group_id": anomaly.group_id,
+                "airport_code": anomaly.airport_code,
+                "reasons": list(anomaly.reasons),
+                "members": sorted(anomaly.members),
+                "violations": [dict(v) for v in anomaly.violations],
+                "detected_at": iso_utc(anomaly.detected_at),
+            }
+            for anomaly in anomalies
+        ]
+        with self._repo.transaction() as conn:
+            self._repo.replace_anomalies(conn, payload)
+        self._repo.refresh_quarantine_set()
+        return payload
 
     # ------------------------------------------------------------------ #
     # Event intake
@@ -44,7 +82,7 @@ class DisruptionService:
 
         with self._repo.transaction() as conn:
             existing = conn.execute(
-                "SELECT event_version, payload_json FROM events WHERE event_id = ?",
+                "SELECT event_id, event_version, payload_json FROM events WHERE event_id = ?",
                 (event.event_id,),
             ).fetchone()
 
@@ -105,9 +143,12 @@ class DisruptionService:
 
         same_body = stored_payload == event.to_dict()
         if same_body:
-            # Idempotent retry: return the original result, bump the counter.
-            self._repo.increment_replay(conn, event.event_id)
+            # Idempotent retry: return the original result. Quarantined chains
+            # are frozen read-only traces, so their replay_count is immutable;
+            # the original result is still returned unchanged.
             impacts = self._repo.get_impacts(event.event_id)
+            if not self._repo.is_quarantined(event.event_id):
+                self._repo.increment_replay(conn, event.event_id)
             return self._result(event, [dict(r) for r in impacts], replayed=True)
 
         # Same identity, different content.
@@ -135,110 +176,105 @@ class DisruptionService:
         )
 
     def _validate_chain(self, conn, event: DisruptionEvent) -> None:
-        """校验必须结合数据库现状判断的事件链规则。"""
-        errors: list[dict[str, str]] = []
+        """校验必须结合数据库现状判断的事件链规则。
 
-        def prior_versions(airport: str) -> list[int]:
-            rows = conn.execute(
-                "SELECT event_version FROM events WHERE airport_code = ?", (airport,)
-            ).fetchall()
-            return [r["event_version"] for r in rows]
+        所有违规在一个事务内收集后抛出，异常会回滚整个事务，因此校验失败
+        不会写入事件、影响，也不会推进任何重放计数。
+        """
+        errors: list[dict[str, str]] = []
+        airport = self._airports[event.airport_code]
+
+        # Clock-dependent reporting rules apply to every intake event.
+        errors.extend(timing_violations(event, airport, now=self._clock()))
 
         if event.event_type == EVENT_CLOSED:
-            versions = prior_versions(event.airport_code)
-            if versions and event.event_version <= max(versions):
+            row = conn.execute(
+                "SELECT MAX(event_version) AS max_version FROM events "
+                "WHERE airport_code = ?",
+                (event.airport_code,),
+            ).fetchone()
+            max_version = row["max_version"]
+            if max_version is not None and event.event_version <= max_version:
                 errors.append(
                     {
                         "field": "event_version",
                         "issue": "must_extend_airport_history",
-                        "stored_version": str(max(versions)),
+                        "stored_version": str(max_version),
                         "received_version": str(event.event_version),
                     }
                 )
+            if errors:
+                raise ValidationError("Event failed chain validation", {"errors": errors})
             return
 
         # extended / reopened must reference a prior event
         ref_id = event.supersedes_event_id
-        ref = None
-        if ref_id is not None:
-            ref = conn.execute(
-                "SELECT * FROM events WHERE event_id = ?", (ref_id,)
+        if ref_id is None:
+            errors.append(
+                {
+                    "field": "supersedes_event_id",
+                    "issue": "required_for_chain_event",
+                }
+            )
+            raise ValidationError("Event failed chain validation", {"errors": errors})
+
+        ref = conn.execute(
+            "SELECT * FROM events WHERE event_id = ?", (ref_id,)
+        ).fetchone()
+        if ref is None:
+            errors.append(
+                {
+                    "field": "supersedes_event_id",
+                    "issue": "unknown_event",
+                    "event_id": ref_id,
+                }
+            )
+        elif self._repo.is_quarantined(ref_id):
+            # Anomalous chains are frozen: no new events may attach to them.
+            errors.append(
+                {
+                    "field": "supersedes_event_id",
+                    "issue": "chain_quarantined",
+                    "event_id": ref_id,
+                }
+            )
+        elif ref["airport_code"] != event.airport_code:
+            errors.append(
+                {
+                    "field": "supersedes_event_id",
+                    "issue": "airport_mismatch",
+                    "referenced_airport": ref["airport_code"],
+                    "received_airport": event.airport_code,
+                }
+            )
+        else:
+            if event.event_version <= ref["event_version"]:
+                errors.append(
+                    {
+                        "field": "event_version",
+                        "issue": "version_must_increase",
+                        "stored_version": str(ref["event_version"]),
+                        "received_version": str(event.event_version),
+                    }
+                )
+            # No branching: a referenced event may have at most one successor.
+            sibling = conn.execute(
+                "SELECT event_id FROM events WHERE supersedes_event_id = ?",
+                (ref_id,),
             ).fetchone()
-            if ref is None:
+            if sibling is not None:
                 errors.append(
                     {
                         "field": "supersedes_event_id",
-                        "issue": "unknown_event",
+                        "issue": "chain_already_extended",
                         "event_id": ref_id,
+                        "existing_successor": sibling["event_id"],
                     }
                 )
-            elif ref["airport_code"] != event.airport_code:
-                errors.append(
-                    {
-                        "field": "supersedes_event_id",
-                        "issue": "airport_mismatch",
-                        "referenced_airport": ref["airport_code"],
-                        "received_airport": event.airport_code,
-                    }
-                )
-            elif ref["event_type"] == EVENT_REOPENED:
-                errors.append(
-                    {
-                        "field": "supersedes_event_id",
-                        "issue": "chain_already_closed",
-                        "event_id": ref_id,
-                    }
-                )
-
-        if event.event_type == EVENT_EXTENDED and ref is not None and not errors:
-            # An extension continues a still-active closure. When the previous
-            # window had a known end, the extension must start no later than it
-            # (no unmodelled open gap) and push the end further out. Extending
-            # an open-ended closure simply supplies the newly known end.
-            prev_until_raw = ref["effective_until"]
-            if prev_until_raw is None:
-                if event.effective_from < parse_ts(ref["effective_from"]):
-                    errors.append(
-                        {
-                            "field": "effective_from",
-                            "issue": "must_not_precede_chain_start",
-                        }
-                    )
-            else:
-                prev_until = parse_ts(prev_until_raw)
-                if event.effective_from > prev_until:
-                    errors.append(
-                        {
-                            "field": "effective_from",
-                            "issue": "extension_leaves_uncovered_gap",
-                        }
-                    )
-                if event.effective_until <= prev_until:
-                    errors.append(
-                        {
-                            "field": "effective_until",
-                            "issue": "must_extend_previous_window",
-                        }
-                    )
-            if event.event_version <= ref["event_version"]:
-                errors.append(
-                    {
-                        "field": "event_version",
-                        "issue": "version_must_increase",
-                        "stored_version": str(ref["event_version"]),
-                        "received_version": str(event.event_version),
-                    }
-                )
-
-        if event.event_type == EVENT_REOPENED and ref is not None and not errors:
-            if event.event_version <= ref["event_version"]:
-                errors.append(
-                    {
-                        "field": "event_version",
-                        "issue": "version_must_increase",
-                        "stored_version": str(ref["event_version"]),
-                        "received_version": str(event.event_version),
-                    }
+            root = self._resolve_root_from(conn, ref)
+            if root is not None:
+                errors.extend(
+                    edge_violations(event, _row_to_event(ref), root, airport)
                 )
 
         if errors:
@@ -247,27 +283,54 @@ class DisruptionService:
     def _resolve_root(self, conn, event: DisruptionEvent) -> DisruptionEvent:
         if event.event_type == EVENT_CLOSED:
             return event
-        # Walk the supersedes chain to the originating closed event.
+        if event.supersedes_event_id is None:
+            raise ValidationError(
+                "Event failed chain validation",
+                {"errors": [
+                    {"field": "supersedes_event_id", "issue": "required_for_chain_event"}
+                ]},
+            )
+        ref = conn.execute(
+            "SELECT * FROM events WHERE event_id = ?",
+            (event.supersedes_event_id,),
+        ).fetchone()
+        if ref is None:  # validated earlier; defensive
+            raise ValidationError("unknown superseded event")
+        root = self._resolve_root_from(conn, ref)
+        if root is None:
+            raise ValidationError("extended/reopened event chain has no closed root")
+        return root
+
+    def _resolve_root_from(self, conn, row) -> DisruptionEvent | None:
+        """从某条已存储事件行出发，沿 supersedes 链找到 closed 根。"""
         seen: set[str] = set()
-        current = event
-        while current.supersedes_event_id is not None:
+        current = _row_to_event(row)
+        while current.event_type != EVENT_CLOSED:
             ref_id = current.supersedes_event_id
+            if ref_id is None:
+                return None
             if ref_id in seen:  # defensive; cycles are structurally prevented
-                raise ValidationError("supersedes chain contains a cycle")
+                return None
             seen.add(ref_id)
-            row = conn.execute(
+            parent = conn.execute(
                 "SELECT * FROM events WHERE event_id = ?", (ref_id,)
             ).fetchone()
-            if row is None:  # validated earlier; defensive
-                raise ValidationError(f"unknown superseded event '{ref_id}'")
-            current = _row_to_event(row)
-            if current.event_type == EVENT_CLOSED:
-                return current
-        raise ValidationError("extended/reopened event chain has no closed root")
+            if parent is None:
+                return None
+            current = _row_to_event(parent)
+        return current
 
     # ------------------------------------------------------------------ #
     # Queries
     # ------------------------------------------------------------------ #
+
+    def chain_anomalies(self) -> dict[str, Any]:
+        anomalies = self._repo.get_anomalies()
+        return {
+            "quarantined_chain_count": len(anomalies),
+            "quarantined_event_count": len(self._repo.quarantined_event_ids),
+            "chains": anomalies,
+        }
 
     def event_status(self, event_id: str) -> dict[str, Any]:
         row = self._repo.get_event_row(event_id)
@@ -283,7 +346,16 @@ class DisruptionService:
         for imp in active:
             statuses[imp["impact_status"]] = statuses.get(imp["impact_status"], 0) + 1
             passengers += imp["passenger_count"]
-        return {
+
+        anomaly = self._repo.anomaly_for_event(event_id)
+        if anomaly is not None:
+            chain_state = "quarantined"
+        elif row["event_type"] == EVENT_REOPENED:
+            chain_state = "closed"
+        else:
+            chain_state = "active"
+
+        result = {
             "event": json.loads(row["payload_json"]),
             "processing": {
                 "state": "processed",
@@ -294,8 +366,18 @@ class DisruptionService:
                 "affected_passengers": passengers,
                 "status_breakdown": statuses,
             },
+            "chain_state": chain_state,
             "impacts": active,
         }
+        if anomaly is not None:
+            # Read-only trace marker: the record is preserved verbatim but does
+            # not participate in current summaries.
+            result["chain_anomaly"] = {
+                "group_id": anomaly["group_id"],
+                "reasons": anomaly["reasons"],
+                "detected_at": anomaly["detected_at"],
+            }
+        return result
 
     def airport_summary(self, airport_code: str) -> dict[str, Any]:
         if airport_code not in self._airports:
@@ -317,12 +399,18 @@ class DisruptionService:
             total_passengers += r["passenger_count"]
             bucket["flights"].append(r["flight_id"])
         chain_roots = [r["event_id"] for r in rows if r["event_type"] == EVENT_CLOSED]
+        reopen_count = sum(1 for r in rows if r["event_type"] == EVENT_REOPENED)
+        quarantined = sum(
+            1
+            for anomaly in self._repo.get_anomalies()
+            if anomaly["airport_code"] == airport_code
+        )
         return {
             "airport_code": airport_code,
             "airport_name": self._airports[airport_code].name,
             "event_count": len(rows),
-            "active_chains": len(chain_roots)
-            - sum(1 for r in rows if r["event_type"] == EVENT_REOPENED),
+            "active_chains": len(chain_roots) - reopen_count,
+            "quarantined_chains": quarantined,
             "affected_flights": len(latest),
             "affected_passengers": total_passengers,
             "by_status": by_status,

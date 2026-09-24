@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.errors import ValidationError
@@ -59,6 +59,27 @@ def load_timezone(name: str) -> ZoneInfo:
             f"Airport timezone '{name}' is not a valid IANA timezone",
             {"timezone": name},
         ) from None
+
+
+def airport_zone(airport) -> ZoneInfo:
+    """机场记录的 IANA 时区（加载时已校验）。"""
+    return ZoneInfo(airport.timezone)
+
+
+def iso_local(local_dt: datetime) -> str:
+    """格式化机场本地墙钟时间，偏移随当日 DST 状态变化（错误明细用）。"""
+    if local_dt.tzinfo is None:
+        raise ValueError("local datetime must be timezone-aware")
+    return local_dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def localize_ambiguous(local_naive: datetime, tz: ZoneInfo, *, fold: int) -> datetime:
+    """显式标注 DST 重复时刻属于 fold 前(0)还是 fold 后(1)的那一次。
+
+    事件输入携带固定 UTC 偏移，正常解析不会产生歧义；该工具供需要直接
+    构造机场本地墙钟的校验/测试使用。
+    """
+    return local_naive.replace(tzinfo=tz, fold=fold)
 
 
 def overlaps(start_a: datetime, end_a: datetime, start_b: datetime, end_b: datetime) -> bool:

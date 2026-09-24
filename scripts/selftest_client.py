@@ -325,6 +325,118 @@ def seed() -> int:
     check(all(i["crosses_midnight"] for i in aps2_result["impacts"]),
           "all offset-window impacts flagged cross-midnight")
 
+    print("== seed: time-causality rejection (no partial writes) ==")
+    # A dedicated APS chain on a flight-free window so it cannot perturb the
+    # pagination totals below: closure 02:00-04:00Z, then rejected attempts.
+    causality_close = {
+        "event_id": "volc-aps-causal01",
+        "event_version": 4,
+        "event_type": "airport.closed",
+        "airport_code": "APS",
+        "effective_from": "2026-09-10T02:00:00Z",
+        "effective_until": "2026-09-10T04:00:00Z",
+        "reported_at": "2026-09-10T01:30:00Z",
+        "reason": "causality fixture closure",
+    }
+    status, _ = post_event(causality_close)
+    check(status == 201, f"causality fixture closure accepted (got {status})")
+
+    causal_rejections = [
+        ("extension before root closure", {
+            "event_id": "volc-aps-causal-bad1",
+            "event_version": 5,
+            "event_type": "airport.extended",
+            "airport_code": "APS",
+            "effective_from": "2026-09-10T01:00:00Z",
+            "effective_until": "2026-09-10T05:00:00Z",
+            "reported_at": "2026-09-10T03:00:00Z",
+            "supersedes_event_id": "volc-aps-causal01",
+        }, "must_not_precede_root_closure"),
+        ("extension leaves an open gap", {
+            "event_id": "volc-aps-causal-bad2",
+            "event_version": 5,
+            "event_type": "airport.extended",
+            "airport_code": "APS",
+            "effective_from": "2026-09-10T04:30:00Z",
+            "effective_until": "2026-09-10T06:00:00Z",
+            "reported_at": "2026-09-10T03:00:00Z",
+            "supersedes_event_id": "volc-aps-causal01",
+        }, "extension_leaves_uncovered_gap"),
+        ("reopen point past closure end", {
+            "event_id": "volc-aps-causal-bad3",
+            "event_version": 5,
+            "event_type": "airport.reopened",
+            "airport_code": "APS",
+            "effective_from": "2026-09-10T04:30:00Z",
+            "reported_at": "2026-09-10T04:31:00Z",
+            "supersedes_event_id": "volc-aps-causal01",
+        }, "reopen_outside_closure_window"),
+        ("reopen buffer overruns closure end", {
+            # APS buffer is 20 minutes: 03:50 + 20 = 04:10 > 04:00 end.
+            "event_id": "volc-aps-causal-bad4",
+            "event_version": 5,
+            "event_type": "airport.reopened",
+            "airport_code": "APS",
+            "effective_from": "2026-09-10T03:50:00Z",
+            "reported_at": "2026-09-10T03:51:00Z",
+            "supersedes_event_id": "volc-aps-causal01",
+        }, "reopen_buffer_extends_past_closure"),
+    ]
+    for label, payload, want_issue in causal_rejections:
+        status, body = post_event(payload)
+        check(status == 422, f"{label}: 422 (got {status})")
+        errs = body.get("error", {}).get("details", {}).get("errors", [])
+        issues = {e["issue"]: e for e in errs}
+        check(want_issue in issues,
+              f"{label}: issue '{want_issue}' named (got {sorted(issues)})")
+        if want_issue in issues:
+            check(issues[want_issue]["field"] == "effective_from",
+                  f"{label}: conflict pinned to effective_from")
+        status, _ = request("GET", f"/api/v1/events/{payload['event_id']}")
+        check(status == 404, f"{label}: rejected event was never persisted")
+
+    print("== seed: touching endpoints (half-open abutment) are accepted ==")
+    # Extension starts exactly at the prior window end (04:00 == 04:00): legal.
+    abut_ext = {
+        "event_id": "volc-aps-causal-ext1",
+        "event_version": 5,
+        "event_type": "airport.extended",
+        "airport_code": "APS",
+        "effective_from": "2026-09-10T04:00:00Z",
+        "effective_until": "2026-09-10T05:00:00Z",
+        "reported_at": "2026-09-10T03:00:00Z",
+        "supersedes_event_id": "volc-aps-causal01",
+    }
+    status, _ = post_event(abut_ext)
+    check(status == 201, f"abutting extension accepted (got {status})")
+    # Reopen 04:40 + 20 min buffer resumes exactly at the 05:00 window end.
+    abut_reopen = {
+        "event_id": "volc-aps-causal-rp1",
+        "event_version": 6,
+        "event_type": "airport.reopened",
+        "airport_code": "APS",
+        "effective_from": "2026-09-10T04:40:00Z",
+        "reported_at": "2026-09-10T04:45:00Z",
+        "supersedes_event_id": "volc-aps-causal-ext1",
+    }
+    status, _ = post_event(abut_reopen)
+    check(status == 201, f"abutting reopen (resume == window end) accepted (got {status})")
+    # A terminal chain cannot be extended further.
+    status, body = post_event({
+        "event_id": "volc-aps-causal-ext2",
+        "event_version": 7,
+        "event_type": "airport.extended",
+        "airport_code": "APS",
+        "effective_from": "2026-09-10T05:00:00Z",
+        "effective_until": "2026-09-10T06:00:00Z",
+        "reported_at": "2026-09-10T05:01:00Z",
+        "supersedes_event_id": "volc-aps-causal-rp1",
+    })
+    check(status == 422 and "chain_already_closed" in str(body),
+          f"extending a reopened chain rejected (got {status})")
+    # Causality chain windows carry no scheduled flights, so they add no impacts.
+    _, causal_page = request("GET", "/api/v1/flights/affected?limit=100")
+
     print("== seed: summaries, filters, pagination ==")
     status, summary = request("GET", "/api/v1/airports/APS/summary")
     check(status == 200, "APS summary 200")

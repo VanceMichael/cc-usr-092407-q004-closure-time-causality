@@ -16,6 +16,12 @@
     "name": "Karta Regional",
     "timezone": "Asia/Jakarta",
     "reopen_buffer_minutes": 10
+  },
+  {
+    "code": "BER",
+    "name": "Berlin DST Probe",
+    "timezone": "Europe/Berlin",
+    "reopen_buffer_minutes": 30
   }
 ]
 
