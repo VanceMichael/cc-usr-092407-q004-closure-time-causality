@@ -63,13 +63,14 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
 
                 if path == "/healthz":
                     self._require_method(method, "GET", path)
-                    if not state.service.healthy():
+                    detail = state.service.health_detail()
+                    if detail["status"] != "ok":
                         self._send_json(
                             503,
                             {"status": "degraded", "detail": "storage unavailable"},
                         )
                         return
-                    self._send_json(200, {"status": "ok"})
+                    self._send_json(200, detail)
                     return
 
                 if path == "/api/v1" or path == "/":

@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS events (
     reason               TEXT,
     payload_json         TEXT NOT NULL,
     replay_count         INTEGER NOT NULL DEFAULT 0,
-    created_at           TEXT NOT NULL
+    created_at           TEXT NOT NULL,
+    quarantined          INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS impacts (
@@ -48,11 +49,28 @@ CREATE TABLE IF NOT EXISTS impacts (
     UNIQUE(event_id, flight_id, airport_code)
 );
 
+CREATE TABLE IF NOT EXISTS chain_anomalies (
+    root_event_id  TEXT PRIMARY KEY,
+    airport_code   TEXT NOT NULL,
+    reasons_json   TEXT NOT NULL,
+    detected_at    TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_impacts_root    ON impacts(root_event_id);
 CREATE INDEX IF NOT EXISTS idx_impacts_airport ON impacts(airport_code, impact_status);
 CREATE INDEX IF NOT EXISTS idx_impacts_flight  ON impacts(flight_id);
 CREATE INDEX IF NOT EXISTS idx_events_airport  ON events(airport_code, event_version);
 """
+
+# 旧版数据库（v1 建表时没有 quarantined 列）的增量迁移。SQLite 支持
+# ALTER TABLE ADD COLUMN，列默认 0，存量行随后由启动审计重新打标。
+_MIGRATIONS = (
+    (
+        "events",
+        "quarantined",
+        "ALTER TABLE events ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0",
+    ),
+)
 
 
 def utcnow_iso() -> str:
@@ -74,6 +92,16 @@ class Repository:
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.execute("PRAGMA synchronous=FULL")
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        for table, column, ddl in _MIGRATIONS:
+            columns = {
+                r["name"]
+                for r in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in columns:
+                self._conn.execute(ddl)
 
     def close(self) -> None:
         with self._lock:
@@ -103,15 +131,46 @@ class Repository:
                 )
             )
 
-    def events_for_airport(self, airport_code: str) -> list[sqlite3.Row]:
+    def events_for_airport(
+        self, airport_code: str, *, include_quarantined: bool = False
+    ) -> list[sqlite3.Row]:
+        sql = (
+            "SELECT * FROM events WHERE airport_code = ? "
+            "ORDER BY event_version, effective_from"
+        )
+        params: list[Any] = [airport_code]
+        if not include_quarantined:
+            sql = sql.replace("WHERE", "WHERE quarantined = 0 AND", 1)
+        with self._lock:
+            return list(self._conn.execute(sql, params))
+
+    def all_events(self) -> list[sqlite3.Row]:
         with self._lock:
             return list(
                 self._conn.execute(
-                    "SELECT * FROM events WHERE airport_code = ? "
-                    "ORDER BY event_version, effective_from",
-                    (airport_code,),
+                    "SELECT * FROM events ORDER BY event_version, event_id"
                 )
             )
+
+    def is_quarantined(self, event_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT quarantined FROM events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            return row is not None and bool(row["quarantined"])
+
+    def list_anomalies(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(
+                self._conn.execute(
+                    "SELECT * FROM chain_anomalies ORDER BY root_event_id"
+                )
+            )
+
+    def anomaly_count(self) -> int:
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) AS n FROM chain_anomalies").fetchone()
+            return int(row["n"])
 
     def count_replays(self, event_id: str) -> int:
         with self._lock:
@@ -130,9 +189,10 @@ class Repository:
 
         同一机场内，每条事件链采用最新事件的快照；航班同时出现在多条链时，
         采用最后生成的快照。`resolved` 墓碑参与排序，使恢复开放后释放的航班
-        不再出现在结果中。最终结果按 flight_id 稳定排序。
+        不再出现在结果中。启动审计隔离的异常链不参与当前汇总。最终结果按
+        flight_id 稳定排序。
         """
-        where = ["i.airport_code = ?"] if airport else []
+        where = ["i.airport_code = ?", "e.quarantined = 0"] if airport else ["e.quarantined = 0"]
         params: list[Any] = [airport] if airport else []
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
@@ -221,6 +281,32 @@ class Repository:
         conn.execute(
             "UPDATE events SET replay_count = replay_count + 1 WHERE event_id = ?",
             (event_id,),
+        )
+
+    def mark_quarantine(
+        self, conn: sqlite3.Connection, event_ids: Iterable[str], flag: int
+    ) -> int:
+        ids = list(event_ids)
+        if not ids:
+            return 0
+        conn.executemany(
+            "UPDATE events SET quarantined = ? WHERE event_id = ?",
+            [(flag, event_id) for event_id in ids],
+        )
+        return len(ids)
+
+    def replace_chain_anomalies(
+        self, conn: sqlite3.Connection, records: Iterable[dict[str, Any]]
+    ) -> None:
+        """以本次审计结果为准重写异常台账（纯数据派生，可重复执行）。"""
+        conn.execute("DELETE FROM chain_anomalies")
+        conn.executemany(
+            """
+            INSERT INTO chain_anomalies (root_event_id, airport_code,
+                                         reasons_json, detected_at)
+            VALUES (:root_event_id, :airport_code, :reasons_json, :detected_at)
+            """,
+            list(records),
         )
 
 

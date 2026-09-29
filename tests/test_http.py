@@ -166,6 +166,66 @@ class HttpTest(ServiceTestCase):
         self.assertTrue(all(i["crosses_midnight"] for i in body["impacts"]))
         self.assertEqual(body["impact_count"], 3)
 
+    def test_reopen_before_closure_422_names_field(self) -> None:
+        _request("POST", f"{self.base}/api/v1/events", base_event())
+        bad = {
+            "event_id": "evt-reopenhttp01",
+            "event_version": 2,
+            "event_type": "airport.reopened",
+            "airport_code": "APS",
+            "effective_from": "2026-09-07T14:00:00Z",
+            "reported_at": "2026-09-07T13:55:00Z",
+            "supersedes_event_id": "evt-close0000001",
+        }
+        status, body = _request("POST", f"{self.base}/api/v1/events", bad)
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "validation_error")
+        fields_issues = [
+            (e["field"], e["issue"]) for e in body["error"]["details"]["errors"]
+        ]
+        self.assertIn(
+            ("effective_from", "reopen_before_closure_start"), fields_issues
+        )
+        # 校验失败不产生事件行。
+        status, _ = _request("GET", f"{self.base}/api/v1/events/evt-reopenhttp01")
+        self.assertEqual(status, 404)
+
+    def test_extension_before_root_422_names_field(self) -> None:
+        _request("POST", f"{self.base}/api/v1/events", base_event())
+        bad = {
+            "event_id": "evt-exthttp0001",
+            "event_version": 2,
+            "event_type": "airport.extended",
+            "airport_code": "APS",
+            "effective_from": "2026-09-07T14:30:00Z",
+            "effective_until": "2026-09-07T20:00:00Z",
+            "reported_at": "2026-09-07T14:00:00Z",
+            "supersedes_event_id": "evt-close0000001",
+        }
+        status, body = _request("POST", f"{self.base}/api/v1/events", bad)
+        self.assertEqual(status, 422)
+        fields_issues = [
+            (e["field"], e["issue"]) for e in body["error"]["details"]["errors"]
+        ]
+        self.assertIn(
+            ("effective_from", "must_not_precede_root_closure"), fields_issues
+        )
+
+    def test_future_reported_at_422(self) -> None:
+        bad = base_event(
+            event_id="evt-futurerep001", reported_at="2030-01-01T00:00:00Z"
+        )
+        status, body = _request("POST", f"{self.base}/api/v1/events", bad)
+        self.assertEqual(status, 422)
+        self.assertIn("reported_at", str(body["error"]["details"]))
+        self.assertIn("reported_at_in_future", str(body["error"]["details"]))
+
+    def test_health_reports_quarantine_count(self) -> None:
+        status, body = _request("GET", f"{self.base}/healthz")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "ok")
+        self.assertIn("quarantined_chains", body)
+
 
 if __name__ == "__main__":
     unittest.main()

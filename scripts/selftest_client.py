@@ -25,6 +25,8 @@ BSR_CLOSE = "volc-bsr-close001"
 KTA_CLOSE = "volc-kta-close001"
 APS_REOPEN = "volc-aps-reopen01"
 APS_CLOSE_2 = "volc-aps-close002"
+LEGACY_ROOT = "volc-legacy-close1"
+LEGACY_REOPEN = "volc-legacy-reopn1"
 
 FAILURES: list[str] = []
 
@@ -281,6 +283,105 @@ def seed() -> int:
     status, _ = request("GET", "/api/v1/events/evt-dangling-ext01")
     check(status == 404, "failed extension produced no event row")
 
+    print("== seed: time-causality conflicts are rejected field by field ==")
+
+    def expect_field_error(label, payload, field, issue):
+        status, body = post_event(payload)
+        errors = body.get("error", {}).get("details", {}).get("errors", [])
+        ok = status == 422 and any(
+            e.get("field") == field and e.get("issue") == issue for e in errors
+        )
+        check(ok, f"{label}: 422 with {field}/{issue} (got {status}, {errors})")
+        return status, body
+
+    # A fresh BSR root in a flight-free window (20:00-23:00Z: no fixture flight
+    # touches BSR then) so these causality probes do not perturb later counts.
+    causal_root = {
+        "event_id": "volc-bsr-causal01",
+        "event_version": 2,
+        "event_type": "airport.closed",
+        "airport_code": "BSR",
+        "effective_from": "2026-09-07T20:00:00Z",
+        "effective_until": "2026-09-07T23:00:00Z",
+        "reported_at": "2026-09-07T19:30:00Z",
+    }
+    status, _ = post_event(causal_root)
+    check(status == 201, f"BSR causality root accepted (got {status})")
+
+    expect_field_error(
+        "extension earlier than root closure",
+        {**causal_root, "event_id": "volc-bsr-extbad1", "event_version": 3,
+         "event_type": "airport.extended",
+         "effective_from": "2026-09-07T19:30:00Z",
+         "effective_until": "2026-09-08T01:00:00Z",
+         "reported_at": "2026-09-07T19:00:00Z",
+         "supersedes_event_id": "volc-bsr-causal01"},
+        "effective_from", "must_not_precede_root_closure",
+    )
+    expect_field_error(
+        "extension across an unmodelled open gap",
+        {**causal_root, "event_id": "volc-bsr-extbad2", "event_version": 3,
+         "event_type": "airport.extended",
+         "effective_from": "2026-09-07T23:30:00Z",
+         "effective_until": "2026-09-08T02:00:00Z",
+         "reported_at": "2026-09-07T23:00:00Z",
+         "supersedes_event_id": "volc-bsr-causal01"},
+        "effective_from", "extension_leaves_uncovered_gap",
+    )
+    expect_field_error(
+        "reopen earlier than the root closure",
+        {**causal_root, "event_id": "volc-bsr-reobad1", "event_version": 3,
+         "event_type": "airport.reopened",
+         "effective_from": "2026-09-07T19:00:00Z",
+         "effective_until": None,
+         "reported_at": "2026-09-07T18:55:00Z",
+         "supersedes_event_id": "volc-bsr-causal01"},
+        "effective_from", "reopen_before_closure_start",
+    )
+    # BSR buffer is 15 min: reopen at 22:50 -> resume 23:05, past the 23:00 end.
+    expect_field_error(
+        "reopen buffer end past current closure end",
+        {**causal_root, "event_id": "volc-bsr-reobad2", "event_version": 3,
+         "event_type": "airport.reopened",
+         "effective_from": "2026-09-07T22:50:00Z",
+         "effective_until": None,
+         "reported_at": "2026-09-07T22:45:00Z",
+         "supersedes_event_id": "volc-bsr-causal01"},
+        "effective_from", "resume_after_closure_end",
+    )
+    expect_field_error(
+        "future reported_at",
+        {**causal_root, "event_id": "volc-bsr-futrep1", "event_version": 4,
+         "event_type": "airport.closed",
+         "supersedes_event_id": None,
+         "reported_at": "2030-01-01T00:00:00Z"},
+        "reported_at", "reported_at_in_future",
+    )
+
+    # 左闭右开端点相接必须合法：延长起点==旧窗口末端。
+    ext_touch = {**causal_root, "event_id": "volc-bsr-extok01", "event_version": 3,
+                 "event_type": "airport.extended",
+                 "effective_from": "2026-09-07T23:00:00Z",
+                 "effective_until": "2026-09-08T01:00:00Z",
+                 "reported_at": "2026-09-07T22:00:00Z",
+                 "supersedes_event_id": "volc-bsr-causal01"}
+    status, _ = post_event(ext_touch)
+    check(status == 201, f"extension starting exactly at prior end accepted (got {status})")
+    # 恢复点 + BSR 15 分钟缓冲恰好等于窗口末端（01:00）也必须合法。
+    reopen_touch = {**causal_root, "event_id": "volc-bsr-reook01", "event_version": 4,
+                    "event_type": "airport.reopened",
+                    "effective_from": "2026-09-08T00:45:00Z",
+                    "effective_until": None,
+                    "reported_at": "2026-09-08T00:40:00Z",
+                    "supersedes_event_id": "volc-bsr-extok01"}
+    status, _ = post_event(reopen_touch)
+    check(status == 201, f"reopen with buffer ending exactly at closure end accepted (got {status})")
+
+    # Failed causal submissions must leave no rows / replay side effects.
+    for rejected_id in ("volc-bsr-extbad1", "volc-bsr-reobad1", "volc-bsr-futrep1"):
+        status, _ = request("GET", f"/api/v1/events/{rejected_id}")
+        check(status == 404, f"rejected causal event '{rejected_id}' never persisted")
+
     # Reopen APS at 15:10Z; with APS's 20 minute buffer operations resume at
     # 15:30Z. AX410 departs at exactly 15:30: touching a half-open interval
     # end means it is no longer impacted - all three flights are resolved.
@@ -464,6 +565,88 @@ def verify() -> int:
     return finish("verify")
 
 
+# --------------------------------------------------------------------------- #
+# Quarantine phase (after a pre-fix-style anomalous chain has been injected
+# directly into the SQLite volume and the container restarted/rebuilt)
+# --------------------------------------------------------------------------- #
+
+LEGACY_ROOT_BODY = {
+    "event_id": LEGACY_ROOT,
+    "event_version": 1,
+    "event_type": "airport.closed",
+    "airport_code": "KTA",
+    "effective_from": "2026-09-07T16:30:00Z",
+    "effective_until": "2026-09-07T18:00:00Z",
+    "reported_at": "2026-09-07T16:00:00Z",
+    "reason": "legacy pre-fix closure",
+}
+
+
+def quarantine() -> int:
+    print("== quarantine: startup audit flagged the legacy anomalous chain ==")
+    status, health = request("GET", "/healthz")
+    check(status == 200 and health["status"] == "ok", "service healthy")
+    check(health.get("quarantined_chains") == 1,
+          f"health reports exactly 1 quarantined chain (got {health.get('quarantined_chains')})")
+
+    for event_id in (LEGACY_ROOT, LEGACY_REOPEN):
+        status, body = request("GET", f"/api/v1/events/{event_id}")
+        check(status == 200, f"quarantined event '{event_id}' still readable (read-only trace)")
+        check(body["processing"]["state"] == "quarantined",
+              f"'{event_id}' processing state is quarantined")
+        anomalies = body.get("anomaly", {}).get("violations", [])
+        check(
+            any(v.get("issue") == "reopen_before_closure_start" for v in anomalies),
+            f"'{event_id}' trace records reopen_before_closure_start",
+        )
+
+    print("== quarantine: anomalous chain excluded from current aggregates ==")
+    status, kta = request("GET", "/api/v1/airports/KTA/summary")
+    check(status == 200, "KTA summary 200")
+    check(LEGACY_ROOT in kta.get("quarantined_chains", []),
+          "KTA summary lists the legacy root as quarantined")
+    check(kta["quarantined_event_count"] == 2,
+          f"KTA summary counts 2 quarantined events (got {kta['quarantined_event_count']})")
+    # KTA_CLOSE (healthy) still shows KX099 delayed; legacy chain must not add rows.
+    kx = request("GET", "/api/v1/flights/affected?airport=KTA")[1]
+    ids = {f["flight_id"] for f in kx["flights"]}
+    check(kx["pagination"]["total"] == 1 and ids == {"KX-099-20260908"},
+          "only healthy-chain KX099 remains in KTA current view")
+    _, page = request("GET", "/api/v1/flights/affected?limit=100")
+    check(page["pagination"]["total"] == 6,
+          f"global current view still totals 6 (got {page['pagination']['total']})")
+
+    print("== quarantine: replay is read-only and never bumps its counter ==")
+    status, before = request("GET", f"/api/v1/events/{LEGACY_ROOT}")
+    count_before = before["processing"]["replay_count"]
+    status, replay = post_event(LEGACY_ROOT_BODY)
+    check(status == 201 and replay["processing_state"] == "quarantined",
+          f"quarantined replay returns quarantined state (got {status}, {replay.get('processing_state')})")
+    status, after = request("GET", f"/api/v1/events/{LEGACY_ROOT}")
+    check(after["processing"]["replay_count"] == count_before,
+          f"quarantined replay did not change replay_count ({count_before})")
+
+    print("== quarantine: new events cannot build on a quarantined chain ==")
+    status, body = post_event({
+        "event_id": "volc-legacy-ext01",
+        "event_version": 3,
+        "event_type": "airport.extended",
+        "airport_code": "KTA",
+        "effective_from": "2026-09-07T17:55:00Z",
+        "effective_until": "2026-09-07T20:00:00Z",
+        "reported_at": "2026-09-07T17:30:00Z",
+        "supersedes_event_id": LEGACY_ROOT,
+    })
+    errors = body.get("error", {}).get("details", {}).get("errors", [])
+    check(status == 422 and any(e.get("issue") == "cannot_extend_quarantined_chain" for e in errors),
+          f"extending a quarantined chain rejected (got {status})")
+
+    print("== quarantine: healthy seed data is untouched ==")
+    status, aps1 = request("GET", f"/api/v1/events/{APS_CLOSE}")
+    check(status == 200 and len(aps1["impacts"]) == 3, "healthy APS chain intact")
+    return finish("quarantine")
+
+
 def finish(phase: str) -> int:
     if FAILURES:
         print(f"\n{phase.upper()} FAILED: {len(FAILURES)} assertion(s) failed")
@@ -480,6 +663,8 @@ def main() -> int:
         return seed()
     if phase == "verify":
         return verify()
+    if phase == "quarantine":
+        return quarantine()
     print(f"unknown phase: {phase}", file=sys.stderr)
     return 2
 

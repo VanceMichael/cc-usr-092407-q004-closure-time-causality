@@ -11,6 +11,7 @@ COPY app/ ./app/
 COPY fixtures/ ./fixtures/
 COPY tests/ ./tests/
 COPY scripts/selftest_client.py ./scripts/selftest_client.py
+COPY scripts/inject_legacy_anomaly.py ./scripts/inject_legacy_anomaly.py
 
 RUN addgroup -S app && adduser -S -G app -h /srv app \
     && mkdir -p /data \

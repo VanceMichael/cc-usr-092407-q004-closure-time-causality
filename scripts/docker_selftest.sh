@@ -78,6 +78,31 @@ log "Recreating the api container against the same named volume"
 "${COMPOSE[@]}" up -d --force-recreate --wait api
 "${COMPOSE[@]}" exec -T api python scripts/selftest_client.py verify http://127.0.0.1:8080
 
+# 7. Legacy anomalous data written by a pre-fix version ----------------------
+# Inject an anomalous chain directly into the SQLite volume (bypassing the
+# current validation, exactly as an older release could have stored it).
+log "Injecting a pre-fix-style anomalous chain straight into the volume"
+"${COMPOSE[@]}" exec -T api python scripts/inject_legacy_anomaly.py
+
+# 8. Restart so the startup audit runs; anomalous chain must be quarantined ---
+log "Restarting api so the startup audit inspects the legacy chain"
+"${COMPOSE[@]}" restart api
+deadline=$(( $(date +%s) + 60 ))
+container_id="$("${COMPOSE[@]}" ps -q api)"
+while :; do
+    health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id" 2>/dev/null || echo starting)"
+    [ "$health" = "healthy" ] && break
+    [ "$(date +%s)" -ge "$deadline" ] && fail "service did not become healthy after quarantine restart (last state: $health)"
+    sleep 1
+done
+log "Verifying quarantine after restart (read-only trace, excluded aggregates)"
+"${COMPOSE[@]}" exec -T api python scripts/selftest_client.py quarantine http://127.0.0.1:8080
+
+# 9. Rebuild the container against the same volume: verdict must be identical --
+log "Force-recreating the api container; quarantine verdict must be reproduced"
+"${COMPOSE[@]}" up -d --force-recreate --wait api
+"${COMPOSE[@]}" exec -T api python scripts/selftest_client.py quarantine http://127.0.0.1:8080
+
 # trap runs the teardown ------------------------------------------------------
 trap - EXIT
 cleanup
